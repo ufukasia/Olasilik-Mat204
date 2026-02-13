@@ -3,7 +3,7 @@ Streamlit tabanli, ogrenci numarasina gore kisilestirilmis 5 soruluk quiz.
 - Soru senaryolari 2-hafta-olasilik sunumundaki temalara dayanir.
 - Sayisal degerler ogrenci numarasindan deterministik olarak uretilir.
 - Cevaplar %5 goreli tolerans ile puanlanir.
-- Sonuclar outputs/quiz_results.csv dosyasina kaydedilir.
+- Sonuclar outputs/quiz_results.db (SQLite) dosyasina kaydedilir.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import json
 import math
 import os
 import random
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -33,8 +34,10 @@ TEACHER_OPTIONS = [
     "Öğr. Gör. Sema ÇİFTÇİ",
 ]
 ANSWER_REL_TOL = 0.05
-RESULTS_PATH = Path("outputs/quiz_results.csv")
+RESULTS_DB_PATH = Path("outputs/quiz_results.db")
+LEGACY_RESULTS_CSV_PATH = Path("outputs/quiz_results.csv")
 QUIZ_CONTROL_PATH = Path("outputs/quiz_control.json")
+QUESTION_COUNT = 5
 DEFAULT_QUIZ_CONTROL: dict[str, Any] = {
     "is_open": False,
     "active_session": "",
@@ -43,6 +46,9 @@ DEFAULT_QUIZ_CONTROL: dict[str, Any] = {
     "session_start": "",
     "session_end": "",
 }
+RESULTS_BASE_COLUMNS = ["timestamp", "student_id", "student_name", "teacher_name", "quiz_session", "score"]
+RESULTS_ANSWER_COLUMNS = [f"q{i}_{suffix}" for i in range(1, QUESTION_COUNT + 1) for suffix in ("given", "correct", "is_correct")]
+_RESULTS_STORAGE_READY = False
 
 
 def _now_iso() -> str:
@@ -176,70 +182,183 @@ def rerun_app() -> None:
         st.experimental_rerun()
 
 
+def get_db_connection() -> sqlite3.Connection:
+    """Sonuclar veritabani baglantisini acar."""
+    RESULTS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(RESULTS_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=10000;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+
+def _ensure_results_table(conn: sqlite3.Connection) -> None:
+    """Sonuclar tablosunu ve indeksleri olusturur."""
+    answer_sql = []
+    for i in range(1, QUESTION_COUNT + 1):
+        answer_sql.append(f"q{i}_given REAL")
+        answer_sql.append(f"q{i}_correct REAL")
+        answer_sql.append(f"q{i}_is_correct INTEGER")
+    answer_sql_block = ",\n            ".join(answer_sql)
+
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS quiz_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            student_id TEXT NOT NULL,
+            student_name TEXT,
+            teacher_name TEXT,
+            quiz_session TEXT NOT NULL,
+            score INTEGER,
+            {answer_sql_block}
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_quiz_results_session_student "
+        "ON quiz_results (quiz_session, student_id)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_results_session ON quiz_results (quiz_session)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_results_teacher ON quiz_results (teacher_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_results_timestamp ON quiz_results (timestamp)")
+
+
+def _normalize_sql_value(value: Any) -> Any:
+    """Pandas/NumPy bos degerlerini SQLite uyumlu hale getirir."""
+    if pd.isna(value):
+        return None
+    return value
+
+
+def _migrate_legacy_csv_if_needed(conn: sqlite3.Connection) -> None:
+    """Eski CSV kayitlarini bir kez SQLite'a tasir."""
+    if not LEGACY_RESULTS_CSV_PATH.exists():
+        return
+
+    existing_count = conn.execute("SELECT COUNT(*) FROM quiz_results").fetchone()[0]
+    if int(existing_count) > 0:
+        return
+
+    try:
+        legacy_df = pd.read_csv(LEGACY_RESULTS_CSV_PATH, encoding="utf-8")
+    except (OSError, pd.errors.ParserError):
+        return
+    if legacy_df.empty:
+        return
+
+    all_columns = RESULTS_BASE_COLUMNS + RESULTS_ANSWER_COLUMNS
+    for col in all_columns:
+        if col not in legacy_df.columns:
+            legacy_df[col] = pd.NA
+
+    rows: list[tuple[Any, ...]] = []
+    for row in legacy_df[all_columns].itertuples(index=False, name=None):
+        normalized = tuple(_normalize_sql_value(value) for value in row)
+        rows.append(normalized)
+    if not rows:
+        return
+
+    placeholders = ",".join("?" for _ in all_columns)
+    columns_sql = ", ".join(all_columns)
+    conn.executemany(
+        f"""
+        INSERT INTO quiz_results ({columns_sql})
+        VALUES ({placeholders})
+        ON CONFLICT(quiz_session, student_id) DO NOTHING
+        """,
+        rows,
+    )
+
+
+def ensure_results_storage_ready() -> None:
+    """SQLite sonuclar deposunu hazirlar."""
+    global _RESULTS_STORAGE_READY
+    if _RESULTS_STORAGE_READY:
+        return
+
+    with get_db_connection() as conn:
+        _ensure_results_table(conn)
+        _migrate_legacy_csv_if_needed(conn)
+    _RESULTS_STORAGE_READY = True
+
+
 def load_results_df() -> pd.DataFrame:
     """Sonuc tablosunu guvenli sekilde okur."""
-    if not RESULTS_PATH.exists():
-        return pd.DataFrame()
+    ensure_results_storage_ready()
     try:
-        return pd.read_csv(RESULTS_PATH, encoding="utf-8")
-    except (OSError, pd.errors.ParserError):
+        with get_db_connection() as conn:
+            return pd.read_sql_query("SELECT * FROM quiz_results", conn)
+    except (OSError, pd.errors.DatabaseError, sqlite3.Error):
         return pd.DataFrame()
 
 
 def clear_results_for_teacher(teacher_name: str) -> int:
     """Secilen ogretmene ait tum sonuc kayitlarini siler."""
-    if not RESULTS_PATH.exists():
-        return 0
-
-    df = load_results_df()
-    if df.empty or "teacher_name" not in df.columns:
-        return 0
-
     teacher_clean = teacher_name.strip()
-    mask = df["teacher_name"].astype(str).str.strip() == teacher_clean
-    removed_count = int(mask.sum())
-    if removed_count == 0:
+    if not teacher_clean:
         return 0
 
-    kept_df = df[~mask].copy()
-    # Dosya yapisini korumak icin kolonlari ayni sekilde yazar.
-    if kept_df.empty:
-        kept_df = df.iloc[0:0].copy()
-    kept_df.to_csv(RESULTS_PATH, index=False, encoding="utf-8")
+    ensure_results_storage_ready()
+    with get_db_connection() as conn:
+        conn.execute(
+            "DELETE FROM quiz_results WHERE TRIM(COALESCE(teacher_name, '')) = ?",
+            (teacher_clean,),
+        )
+        removed_count = int(conn.execute("SELECT changes()").fetchone()[0])
     return removed_count
 
 
 def get_existing_submission(student_id: str, quiz_session: str) -> dict[str, Any] | None:
     """Ayni ogrencinin ayni oturumdaki kaydini bulur."""
-    if not quiz_session:
-        return None
-
-    df = load_results_df()
-    if df.empty or "quiz_session" not in df.columns or "student_id" not in df.columns:
-        return None
-
+    session_clean = quiz_session.strip()
     sid = student_id.strip()
-    mask = (df["quiz_session"].astype(str) == quiz_session) & (df["student_id"].astype(str).str.strip() == sid)
-    if not mask.any():
+    if not session_clean or not sid:
         return None
 
-    latest = df[mask].sort_values("timestamp", ascending=False).iloc[0]
-    return latest.to_dict()
+    ensure_results_storage_ready()
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM quiz_results
+            WHERE quiz_session = ?
+              AND TRIM(student_id) = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (session_clean, sid),
+        ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
 
 
 def submission_count_for_session(quiz_session: str, teacher_name: str | None = None) -> int:
     """Bir oturumdaki toplam teslim sayisi (istege bagli ogretmen filtresiyle)."""
-    if not quiz_session:
+    session_clean = quiz_session.strip()
+    if not session_clean:
         return 0
 
-    df = load_results_df()
-    if df.empty or "quiz_session" not in df.columns:
-        return 0
-
-    mask = df["quiz_session"].astype(str).str.strip() == quiz_session.strip()
-    if teacher_name and "teacher_name" in df.columns:
-        mask = mask & (df["teacher_name"].astype(str).str.strip() == teacher_name.strip())
-    return int(mask.sum())
+    ensure_results_storage_ready()
+    with get_db_connection() as conn:
+        if teacher_name and teacher_name.strip():
+            count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM quiz_results
+                WHERE quiz_session = ?
+                  AND TRIM(COALESCE(teacher_name, '')) = ?
+                """,
+                (session_clean, teacher_name.strip()),
+            ).fetchone()[0]
+        else:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM quiz_results WHERE quiz_session = ?",
+                (session_clean,),
+            ).fetchone()[0]
+    return int(count)
 
 
 def rng_from_student(student_id: str, quiz_session: str) -> random.Random:
@@ -581,9 +700,9 @@ def record_result(
     quiz_session: str,
     score: int,
     answers: list[dict[str, Any]],
-):
-    """Sonuclari CSV dosyasina ekler."""
-    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+) -> bool:
+    """Sonuclari SQLite veritabanina ekler."""
+    ensure_results_storage_ready()
 
     row: dict[str, Any] = {
         "timestamp": _now_iso(),
@@ -593,23 +712,28 @@ def record_result(
         "quiz_session": quiz_session,
         "score": score,
     }
-    for i, item in enumerate(answers, start=1):
-        row[f"q{i}_given"] = item["given"]
-        row[f"q{i}_correct"] = item["correct"]
-        row[f"q{i}_is_correct"] = item["is_correct"]
+    for i in range(1, QUESTION_COUNT + 1):
+        answer = answers[i - 1] if i - 1 < len(answers) else None
+        row[f"q{i}_given"] = float(answer["given"]) if answer and answer.get("given") is not None else None
+        row[f"q{i}_correct"] = float(answer["correct"]) if answer and answer.get("correct") is not None else None
+        row[f"q{i}_is_correct"] = int(bool(answer["is_correct"])) if answer and "is_correct" in answer else None
 
-    new_df = pd.DataFrame([row])
-    if RESULTS_PATH.exists():
-        old_df = pd.read_csv(RESULTS_PATH, encoding="utf-8")
-        for col in new_df.columns:
-            if col not in old_df.columns:
-                old_df[col] = pd.NA
-        for col in old_df.columns:
-            if col not in new_df.columns:
-                new_df[col] = pd.NA
-        pd.concat([old_df, new_df], ignore_index=True).to_csv(RESULTS_PATH, index=False, encoding="utf-8")
-    else:
-        new_df.to_csv(RESULTS_PATH, index=False, encoding="utf-8")
+    all_columns = RESULTS_BASE_COLUMNS + RESULTS_ANSWER_COLUMNS
+    values = tuple(row.get(col) for col in all_columns)
+    placeholders = ",".join("?" for _ in all_columns)
+    columns_sql = ", ".join(all_columns)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            f"""
+            INSERT INTO quiz_results ({columns_sql})
+            VALUES ({placeholders})
+            ON CONFLICT(quiz_session, student_id) DO NOTHING
+            """,
+            values,
+        )
+        inserted_count = int(conn.execute("SELECT changes()").fetchone()[0])
+    return inserted_count > 0
 
 
 def evaluate_quiz_availability(control: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
@@ -978,13 +1102,15 @@ def main():
             if ok:
                 score += 20
 
+        is_saved = record_result(student_id_clean, student_name_clean, teacher_name_clean, active_session, score, scored)
+        if not is_saved:
+            st.error("Bu oturum icin kaydiniz zaten alinmis.")
+            st.stop()
+
         st.success(f"Toplam puan: {score}/100")
         st.info("Sonucunuz kaydedildi. Guvenlik nedeniyle dogru cevaplar ogrenci ekraninda gosterilmez.")
-
-        record_result(student_id_clean, student_name_clean, teacher_name_clean, active_session, score, scored)
         st.balloons()
 
 
 if __name__ == "__main__":
     main()
-
